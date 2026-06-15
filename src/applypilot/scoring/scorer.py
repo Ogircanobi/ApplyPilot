@@ -14,6 +14,12 @@ from datetime import datetime, timezone
 from applypilot.config import RESUME_PATH, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
+from applypilot.security import (
+    sanitize_for_prompt,
+    scan_for_injection,
+    wrap_untrusted,
+    log_security_event,
+)
 
 log = logging.getLogger(__name__)
 
@@ -80,16 +86,33 @@ def score_job(resume_text: str, job: dict) -> dict:
     Returns:
         {"score": int, "keywords": str, "reasoning": str}
     """
+    # Untrusted: title/company/location/description all come from scraped pages.
+    # Scan for injection (quarantine = log + neutralize, never hard-drop a score),
+    # then normalize every field before it touches the prompt.
+    raw_desc = (job.get("full_description") or "")[:6000]
+    scan = scan_for_injection(f"{job.get('title','')} {raw_desc}")
+    if scan.suspicious:
+        log_security_event(
+            "score_injection",
+            detail=f"job={job.get('title','?')[:60]} | {scan.summary}",
+            url=job.get("url", ""),
+            hits=scan.hits,
+        )
+
     job_text = (
-        f"TITLE: {job['title']}\n"
-        f"COMPANY: {job['site']}\n"
-        f"LOCATION: {job.get('location', 'N/A')}\n\n"
-        f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
+        f"TITLE: {sanitize_for_prompt(job['title'], max_len=300)}\n"
+        f"COMPANY: {sanitize_for_prompt(job['site'], max_len=120)}\n"
+        f"LOCATION: {sanitize_for_prompt(job.get('location', 'N/A'), max_len=120)}\n\n"
+        f"DESCRIPTION:\n{sanitize_for_prompt(raw_desc, max_len=6000)}"
     )
 
+    # Resume is trusted (user's own file); job posting is untrusted -> fenced.
     messages = [
         {"role": "system", "content": SCORE_PROMPT},
-        {"role": "user", "content": f"RESUME:\n{resume_text}\n\n---\n\nJOB POSTING:\n{job_text}"},
+        {"role": "user", "content": (
+            f"RESUME:\n{resume_text}\n\n---\n\n"
+            + wrap_untrusted(job_text, "UNTRUSTED JOB POSTING", normalize=False)
+        )},
     ]
 
     try:

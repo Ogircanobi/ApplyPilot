@@ -26,6 +26,12 @@ from applypilot.scoring.validator import (
     validate_json_fields,
     validate_tailored_resume,
 )
+from applypilot.security import (
+    sanitize_for_prompt,
+    scan_for_injection,
+    wrap_untrusted,
+    log_security_event,
+)
 
 log = logging.getLogger(__name__)
 
@@ -369,11 +375,22 @@ def tailor_resume(
     Returns:
         (tailored_text, report) where report contains validation details.
     """
+    # Untrusted scraped fields -> scan + normalize before prompt embedding.
+    raw_desc = (job.get("full_description") or "")[:6000]
+    scan = scan_for_injection(f"{job.get('title','')} {raw_desc}")
+    if scan.suspicious:
+        log_security_event(
+            "tailor_injection",
+            detail=f"job={job.get('title','?')[:60]} | {scan.summary}",
+            url=job.get("url", ""),
+            hits=scan.hits,
+        )
+
     job_text = (
-        f"TITLE: {job['title']}\n"
-        f"COMPANY: {job['site']}\n"
-        f"LOCATION: {job.get('location', 'N/A')}\n\n"
-        f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
+        f"TITLE: {sanitize_for_prompt(job['title'], max_len=300)}\n"
+        f"COMPANY: {sanitize_for_prompt(job['site'], max_len=120)}\n"
+        f"LOCATION: {sanitize_for_prompt(job.get('location', 'N/A'), max_len=120)}\n\n"
+        f"DESCRIPTION:\n{sanitize_for_prompt(raw_desc, max_len=6000)}"
     )
 
     report: dict = {
@@ -397,7 +414,11 @@ def tailor_resume(
 
         messages = [
             {"role": "system", "content": prompt},
-            {"role": "user", "content": f"ORIGINAL RESUME:\n{resume_text}\n\n---\n\nTARGET JOB:\n{job_text}\n\nReturn the JSON:"},
+            {"role": "user", "content": (
+                f"ORIGINAL RESUME:\n{resume_text}\n\n---\n\nTARGET JOB:\n"
+                + wrap_untrusted(job_text, "UNTRUSTED JOB POSTING", normalize=False)
+                + "\n\nReturn the JSON:"
+            )},
         ]
 
         raw = client.chat(messages, max_tokens=2048, temperature=0.4)
