@@ -39,3 +39,7 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+# Personal data (résumé)
+Rigoberto_Alvarez.pdf
+*.pdf

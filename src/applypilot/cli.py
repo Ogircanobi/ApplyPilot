@@ -150,6 +150,10 @@ def apply(
     model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
+    yes: bool = typer.Option(
+        False, "--yes", "-y",
+        help="Confirm LIVE submission (clicks Submit). Without this, real submits require an interactive confirmation.",
+    ),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
@@ -233,6 +237,22 @@ def apply(
     from applypilot.apply.launcher import main as apply_main
 
     effective_limit = limit if limit is not None else (0 if continuous else 1)
+
+    # Human-in-the-loop gate for LIVE submissions. Auto-apply submits real
+    # applications with your personal data; a crafted job listing could try to
+    # redirect that. Require explicit confirmation unless --dry-run or --yes.
+    if not dry_run and not yes:
+        n = "unlimited" if continuous else effective_limit
+        console.print(
+            f"\n[bold yellow]LIVE submission gate[/bold yellow] — this will submit up to "
+            f"[bold]{n}[/bold] real application(s) using your profile data."
+        )
+        console.print(
+            "[dim]Scraped job content is untrusted. Use --dry-run to preview without submitting.[/dim]"
+        )
+        if not typer.confirm("Proceed with LIVE submissions?", default=False):
+            console.print("[dim]Aborted. No applications submitted.[/dim]")
+            raise typer.Exit(code=0)
 
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")

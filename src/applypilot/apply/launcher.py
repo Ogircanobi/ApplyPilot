@@ -26,6 +26,11 @@ from rich.live import Live
 from applypilot import config
 from applypilot.database import get_connection
 from applypilot.apply import chrome, dashboard, prompt as prompt_mod
+from applypilot.security import (
+    validate_apply_url,
+    scan_for_injection,
+    log_security_event,
+)
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
     reset_worker_dir, cleanup_on_exit, _kill_process_tree,
@@ -303,6 +308,36 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         'applied', 'expired', 'captcha', 'login_issue',
         'failed:reason', or 'skipped'.
     """
+    # ── Security gate (runs BEFORE the privileged agent is spawned) ──────────
+    # The apply agent runs with bypassPermissions and holds credentials, so the
+    # scraped target URL and job content are validated here first.
+    nav_url = job.get("application_url") or job.get("url", "")
+    url_check = validate_apply_url(
+        nav_url, source_url=job.get("url"), require_same_host=False
+    )
+    if not url_check.ok:
+        log_security_event(
+            "apply_blocked_url",
+            detail=f"reason={url_check.reason} host={url_check.host} job={job.get('title','?')[:50]}",
+            url=nav_url,
+        )
+        return f"failed:unsafe_url_{url_check.reason}", 0
+
+    # Scan the job content the agent will ingest. A suspicious posting is
+    # quarantined (we refuse to drive the privileged agent into it) rather than
+    # silently applied — surfaced as a permanent failure for human review.
+    job_scan = scan_for_injection(
+        f"{job.get('title','')} {job.get('full_description','') or ''}"
+    )
+    if job_scan.suspicious:
+        log_security_event(
+            "apply_quarantine_injection",
+            detail=f"job={job.get('title','?')[:50]} | {job_scan.summary}",
+            url=nav_url,
+            hits=job_scan.hits,
+        )
+        return "failed:quarantined_injection", 0
+
     # Read tailored resume text
     resume_path = job.get("tailored_resume_path")
     txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
@@ -526,9 +561,12 @@ PERMANENT_FAILURES: set[str] = {
     "not_a_job_application", "unsafe_permissions",
     "unsafe_verification", "sso_required",
     "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
+    "quarantined_injection",
 }
 
-PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")
+PERMANENT_PREFIXES: tuple[str, ...] = (
+    "site_blocked", "cloudflare", "blocked_by", "unsafe_url", "quarantined",
+)
 
 
 def _is_permanent_failure(result: str) -> bool:
